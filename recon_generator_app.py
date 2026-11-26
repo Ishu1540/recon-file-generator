@@ -9,7 +9,7 @@ import zipfile
 st.set_page_config(page_title="3-Way UPI Recon Data Generator", layout="wide")
 
 st.title("⚡ Realistic 3-Way UPI Reconciliation File Generator")
-st.caption("Generates NPCI, Switch, and CBS files with synchronized RRNs, MMID, TID, Accounts, VPAs, plus realistic TCC102, TCC103, Partial Matches, Duplicates, and Single/Dual-Leg Unmatched records.")
+st.caption("Generates NPCI, Switch, and CBS files with synchronized RRNs, MMID, TID, Accounts, VPAs, plus TCC102, TCC103, RB (Reversal) breaks, Partial Matches, Duplicates, and Single/Dual-Leg Unmatched records.")
 
 # ================= Sidebar Configuration =================
 st.sidebar.header("1. Volume & Baseline Settings")
@@ -19,9 +19,12 @@ min_amt = st.sidebar.number_input("Min Amount (₹)", value=10.0, step=10.0)
 max_amt = st.sidebar.number_input("Max Amount (₹)", value=10000.0, step=50.0)
 random_seed = st.sidebar.number_input("Random Seed (0 for random)", min_value=0, max_value=999999, value=42)
 
-st.sidebar.header("2. NPCI & Partial Match Exceptions (%)")
-pct_tcc102 = st.sidebar.slider("TCC 102 (NPCI Success, Switch Failed, Missing CBS) %", 0.0, 10.0, 1.5, 0.5)
-pct_tcc103 = st.sidebar.slider("TCC 103 (NPCI & Switch Success, Missing CBS) %", 0.0, 10.0, 1.5, 0.5)
+st.sidebar.header("2. NPCI TCC, RB & Partial Match Exceptions (%)")
+pct_tcc102 = st.sidebar.slider("TCC 102 (NPCI 00, Switch Failed, Missing CBS) %", 0.0, 10.0, 1.5, 0.5)
+pct_tcc103 = st.sidebar.slider("TCC 103 (NPCI & Switch 00, Missing CBS) %", 0.0, 10.0, 1.5, 0.5)
+pct_rb_matched = st.sidebar.slider("RB - Matched Reversal (NPCI RB, Sw Failed, CBS Reversed) %", 0.0, 10.0, 1.5, 0.5)
+pct_rb_cbs_unrev = st.sidebar.slider("RB - Unreversed in CBS (NPCI RB, Sw Failed, CBS Success) %", 0.0, 10.0, 1.5, 0.5)
+pct_rb_both_unrev = st.sidebar.slider("RB - Unreversed in Switch & CBS (NPCI RB, Sw & CBS Success) %", 0.0, 10.0, 1.0, 0.5)
 pct_partial_cbs = st.sidebar.slider("Partial Match - CBS Mismatch %", 0.0, 10.0, 1.5, 0.5)
 pct_partial_switch = st.sidebar.slider("Partial Match - Switch Mismatch %", 0.0, 10.0, 1.0, 0.5)
 pct_partial_both = st.sidebar.slider("Partial Match - Both CBS & Switch Mismatch %", 0.0, 10.0, 1.0, 0.5)
@@ -81,7 +84,7 @@ def build_recon_data(n, t_date, min_a, max_a, seed):
     ]
     pe_vpas = [random.choice(pevpa_pool) for _ in range(n)]
 
-    statuses = np.random.choice(["SUCCESS", "FAILED"], size=n, p=[0.93, 0.07])
+    statuses = np.random.choice(["SUCCESS", "FAILED"], size=n, p=[0.94, 0.06])
 
     df = pd.DataFrame({
         "bank_rrn": bank_rrns,
@@ -104,6 +107,9 @@ def build_recon_data(n, t_date, min_a, max_a, seed):
     scenario_specs = [
         ("TCC102_NPCI_SUCCESS_SW_FAIL_NO_CBS", pct_tcc102),
         ("TCC103_NPCI_SW_SUCCESS_NO_CBS", pct_tcc103),
+        ("RB_MATCHED_REVERSAL", pct_rb_matched),
+        ("RB_UNREVERSED_IN_CBS", pct_rb_cbs_unrev),
+        ("RB_UNREVERSED_IN_SWITCH_AND_CBS", pct_rb_both_unrev),
         ("PARTIAL_MATCH_CBS_DIFF", pct_partial_cbs),
         ("PARTIAL_MATCH_SWITCH_DIFF", pct_partial_switch),
         ("PARTIAL_MATCH_BOTH_CBS_SW_DIFF", pct_partial_both),
@@ -124,11 +130,14 @@ def build_recon_data(n, t_date, min_a, max_a, seed):
             df.loc[shuffled[pos:pos + cnt], "expected_recon_status"] = label
             pos += cnt
 
-    # Force clean SUCCESS base status for match & TCC scenarios so codes align realistically
+    # Force clean SUCCESS base status for match, TCC, partial, duplicate, and RB cases before applying overrides
     clean_success_mask = df["expected_recon_status"].isin([
         "FULLY_MATCHED",
         "TCC102_NPCI_SUCCESS_SW_FAIL_NO_CBS",
         "TCC103_NPCI_SW_SUCCESS_NO_CBS",
+        "RB_MATCHED_REVERSAL",
+        "RB_UNREVERSED_IN_CBS",
+        "RB_UNREVERSED_IN_SWITCH_AND_CBS",
         "PARTIAL_MATCH_CBS_DIFF",
         "PARTIAL_MATCH_SWITCH_DIFF",
         "PARTIAL_MATCH_BOTH_CBS_SW_DIFF",
@@ -144,18 +153,23 @@ def build_recon_data(n, t_date, min_a, max_a, seed):
     ]
     npci_df = df[~df["expected_recon_status"].isin(npci_exclude)].copy()
 
-    # Inject NPCI duplicates (subset of DUPLICATE_ENTRY)
+    # Inject NPCI duplicates
     dup_pool = npci_df[npci_df["expected_recon_status"] == "DUPLICATE_ENTRY"]
     if len(dup_pool) > 0:
         npci_dups = dup_pool.sample(frac=0.5, random_state=seed if seed > 0 else None).copy()
         npci_df = pd.concat([npci_df, npci_dups], ignore_index=True)
 
     npci_n = len(npci_df)
-    fail_codes = ["RB", "U03", "U05", "U06", "U07", "U10", "U14", "U16", "U17", "U18"]
-    assigned_npci_codes = [
-        "00" if s == "SUCCESS" else random.choice(fail_codes)
-        for s in npci_df["base_status"]
-    ]
+    other_fail_codes = ["U03", "U05", "U06", "U07", "U10", "U14", "U16", "U17", "U18"]
+
+    assigned_npci_codes = []
+    for status, scen in zip(npci_df["base_status"], npci_df["expected_recon_status"]):
+        if scen in ["RB_MATCHED_REVERSAL", "RB_UNREVERSED_IN_CBS", "RB_UNREVERSED_IN_SWITCH_AND_CBS"]:
+            assigned_npci_codes.append("RB")
+        elif status == "SUCCESS":
+            assigned_npci_codes.append("00")
+        else:
+            assigned_npci_codes.append(random.choice(other_fail_codes))
 
     lite_balances = [
         round(random.random() * 500000, 2) if random.randint(1, 10) <= 7 else random.randint(100, 500000)
@@ -207,7 +221,7 @@ def build_recon_data(n, t_date, min_a, max_a, seed):
     ]
     switch_df = df[~df["expected_recon_status"].isin(switch_exclude)].copy()
 
-    # Inject Switch duplicates (remaining subset of DUPLICATE_ENTRY)
+    # Inject Switch duplicates
     sw_dup_pool = switch_df[switch_df["expected_recon_status"] == "DUPLICATE_ENTRY"]
     if len(sw_dup_pool) > 0:
         sw_dups = sw_dup_pool.sample(frac=0.3, random_state=(seed + 1) if seed > 0 else None).copy()
@@ -216,10 +230,24 @@ def build_recon_data(n, t_date, min_a, max_a, seed):
     switch_times = switch_df["time"] + pd.to_timedelta(np.random.randint(1, 3, size=len(switch_df)), unit='s')
     switch_amt = switch_df["amount"].copy()
     switch_status = switch_df["base_status"].copy()
+    switch_resp_code = np.where(switch_status == "SUCCESS", "00", "U69")
+    switch_rev_flag = np.full(len(switch_df), "N", dtype=object)
 
     # TCC 102: Switch shows FAILED (timeout), while NPCI settled
     tcc102_mask = switch_df["expected_recon_status"] == "TCC102_NPCI_SUCCESS_SW_FAIL_NO_CBS"
     switch_status.loc[tcc102_mask] = "FAILED"
+    switch_resp_code = np.where(tcc102_mask, "U69", switch_resp_code)
+
+    # RB cases where Switch properly recorded the RB reversal
+    rb_sw_rev_mask = switch_df["expected_recon_status"].isin([
+        "RB_MATCHED_REVERSAL",
+        "RB_UNREVERSED_IN_CBS"
+    ])
+    switch_status.loc[rb_sw_rev_mask] = "FAILED"
+    switch_resp_code = np.where(rb_sw_rev_mask, "RB", switch_resp_code)
+    switch_rev_flag = np.where(rb_sw_rev_mask, "Y", switch_rev_flag)
+
+    # RB_UNREVERSED_IN_SWITCH_AND_CBS stays SUCCESS / 00 / N in Switch (the break)
 
     # Partial Match in Switch (or Both)
     sw_partial_mask = switch_df["expected_recon_status"].isin([
@@ -247,7 +275,7 @@ def build_recon_data(n, t_date, min_a, max_a, seed):
         "Txn Mode": "P2M",
         "Initiation Mode": "00",
         "Purpose Code": "00",
-        "Response Code": np.where(switch_status == "SUCCESS", "00", "U69"),
+        "Response Code": switch_resp_code,
         "Status": switch_status,
         "Auth Code": [f"ATH{random.randint(10000, 99999)}" for _ in range(len(switch_df))],
         "Merchant ID": switch_df["merchant_id"],
@@ -255,7 +283,7 @@ def build_recon_data(n, t_date, min_a, max_a, seed):
         "Acquirer IFSC": "HDFC0000001",
         "Issuer IFSC": "SBIN0001234",
         "Channel": "UPI",
-        "Reversal Flag": "N"
+        "Reversal Flag": switch_rev_flag
     })
 
     # ------------------ 3. BUILD CBS FILE ------------------
@@ -277,6 +305,14 @@ def build_recon_data(n, t_date, min_a, max_a, seed):
     cbs_times = cbs_df["time"] + pd.to_timedelta(np.random.randint(3, 7, size=len(cbs_df)), unit='s')
     cbs_amt = cbs_df["amount"].copy()
     cbs_status = cbs_df["base_status"].copy()
+    cbs_rev_flag = np.full(len(cbs_df), "N", dtype=object)
+
+    # RB_MATCHED_REVERSAL: CBS reversed the debit cleanly
+    rb_cbs_matched_mask = cbs_df["expected_recon_status"] == "RB_MATCHED_REVERSAL"
+    cbs_status.loc[rb_cbs_matched_mask] = "REVERSED"
+    cbs_rev_flag = np.where(rb_cbs_matched_mask, "Y", cbs_rev_flag)
+
+    # RB_UNREVERSED_IN_CBS & RB_UNREVERSED_IN_SWITCH_AND_CBS remain SUCCESS / Reversal Flag = N (the customer debit break)
 
     # Partial Match in CBS (or Both)
     cbs_partial_mask = cbs_df["expected_recon_status"].isin([
@@ -301,13 +337,13 @@ def build_recon_data(n, t_date, min_a, max_a, seed):
         "Amount": cbs_amt,
         "Dr/Cr Indicator": "DR",
         "GL Code": "GL2400109",
-        "Narration/Remarks": "UPI OUTWARD SETTLEMENT",
+        "Narration/Remarks": np.where(cbs_rev_flag == "Y", "UPI RB REVERSAL CREDIT", "UPI OUTWARD SETTLEMENT"),
         "Txn Status": cbs_status,
         "Channel": "UPI",
         "Merchant ID": cbs_df["merchant_id"],
         "Terminal ID": cbs_df["terminal_id"],
         "Settlement Batch": f"BATCH_{t_date.strftime('%Y%m%d')}_01",
-        "Reversal Flag": "N"
+        "Reversal Flag": cbs_rev_flag
     })
 
     # Shuffle output row order so anomalies aren't grouped together
