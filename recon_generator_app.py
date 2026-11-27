@@ -9,7 +9,7 @@ import zipfile
 st.set_page_config(page_title="3-Way UPI Recon Data Generator", layout="wide")
 
 st.title("⚡ Realistic 3-Way UPI Reconciliation File Generator")
-st.caption("Generates synchronized NPCI, Switch, and CBS files with clean bucket separation for TCC102, TCC103, RB Reversals, Partial Matches, Duplicates, and Single/Dual-Leg Unmatched records.")
+st.caption("Generates synchronized NPCI, Switch, and CBS files with 00 (Success), RB (Reversal), and U-Series Failed transactions, plus TCC102, TCC103, Partial Matches, Duplicates, and Single/Dual-Leg Unmatched records.")
 
 # ================= Sidebar Configuration =================
 st.sidebar.header("1. Volume & Baseline Settings")
@@ -19,7 +19,9 @@ min_amt = st.sidebar.number_input("Min Amount (₹)", value=10.0, step=10.0)
 max_amt = st.sidebar.number_input("Max Amount (₹)", value=10000.0, step=50.0)
 random_seed = st.sidebar.number_input("Random Seed (0 for random)", min_value=0, max_value=999999, value=42)
 
-st.sidebar.header("2. TCC & RB Reversal Scenarios (%)")
+st.sidebar.header("2. NPCI Failed, TCC & RB Scenarios (%)")
+pct_failed_matched = st.sidebar.slider("NPCI Failed - Matched Decline (NPCI U-code, Sw & CBS Failed) %", 0.0, 15.0, 4.0, 0.5)
+pct_failed_cbs_break = st.sidebar.slider("NPCI Failed - Customer Debit Break (NPCI U-code, Sw Failed, CBS Success) %", 0.0, 10.0, 1.0, 0.5)
 pct_tcc102 = st.sidebar.slider("TCC 102 (NPCI 00, Switch Failed, Missing CBS) %", 0.0, 10.0, 1.5, 0.5)
 pct_tcc103 = st.sidebar.slider("TCC 103 (NPCI & Switch 00, Missing CBS) %", 0.0, 10.0, 1.5, 0.5)
 pct_rb_matched = st.sidebar.slider("RB - Matched Reversal (NPCI RB, Sw Failed, CBS Reversed) %", 0.0, 10.0, 1.5, 0.5)
@@ -83,7 +85,6 @@ def build_recon_data(n, t_date, min_a, max_a, seed):
     ]
     pe_vpas = [random.choice(pevpa_pool) for _ in range(n)]
 
-    # Default all master transactions to clean SUCCESS so random base failures don't bleed into recon buckets
     df = pd.DataFrame({
         "bank_rrn": bank_rrns,
         "npci_rrn": npci_rrns,
@@ -97,12 +98,13 @@ def build_recon_data(n, t_date, min_a, max_a, seed):
         "terminal_id": terminal_ids,
         "pr_vpa": pr_vpas,
         "pe_vpa": pe_vpas,
-        "base_status": "SUCCESS",
         "expected_recon_status": "FULLY_MATCHED"
     })
 
     # 2. Assign Strictly Isolated Reconciliation Scenarios
     scenario_specs = [
+        ("FAILED_MATCHED_DECLINE", pct_failed_matched),
+        ("FAILED_CBS_DEBIT_BREAK", pct_failed_cbs_break),
         ("TCC102_NPCI_00_SW_FAIL_NO_CBS", pct_tcc102),
         ("TCC103_NPCI_00_SW_00_NO_CBS", pct_tcc103),
         ("RB_MATCHED_REVERSAL", pct_rb_matched),
@@ -135,7 +137,7 @@ def build_recon_data(n, t_date, min_a, max_a, seed):
     ]
     npci_df = df[~df["expected_recon_status"].isin(npci_exclude)].copy()
 
-    # Inject NPCI duplicates (only from DUPLICATE_ENTRY bucket)
+    # Inject NPCI duplicates
     dup_pool = npci_df[npci_df["expected_recon_status"] == "DUPLICATE_ENTRY"]
     if len(dup_pool) > 0:
         npci_dups = dup_pool.sample(frac=0.5, random_state=seed if seed > 0 else None).copy()
@@ -143,10 +145,17 @@ def build_recon_data(n, t_date, min_a, max_a, seed):
 
     npci_n = len(npci_df)
     rb_scenarios = {"RB_MATCHED_REVERSAL", "RB_UNREVERSED_IN_CBS", "RB_UNREVERSED_IN_SWITCH_AND_CBS"}
-    assigned_npci_codes = [
-        "RB" if scen in rb_scenarios else "00"
-        for scen in npci_df["expected_recon_status"]
-    ]
+    failed_scenarios = {"FAILED_MATCHED_DECLINE", "FAILED_CBS_DEBIT_BREAK"}
+    npci_fail_codes = ["U03", "U05", "U06", "U07", "U10", "U14", "U16", "U17", "U18", "U28", "U30", "U69"]
+
+    assigned_npci_codes = []
+    for scen in npci_df["expected_recon_status"]:
+        if scen in rb_scenarios:
+            assigned_npci_codes.append("RB")
+        elif scen in failed_scenarios:
+            assigned_npci_codes.append(random.choice(npci_fail_codes))
+        else:
+            assigned_npci_codes.append("00")
 
     lite_balances = [
         round(random.random() * 500000, 2) if random.randint(1, 10) <= 7 else random.randint(100, 500000)
@@ -210,10 +219,14 @@ def build_recon_data(n, t_date, min_a, max_a, seed):
     switch_resp_code = pd.Series("00", index=switch_df.index, dtype=object)
     switch_rev_flag = pd.Series("N", index=switch_df.index, dtype=object)
 
-    # TCC 102: Switch shows FAILED (U69 timeout), NPCI settled 00, CBS missing
-    tcc102_mask = switch_df["expected_recon_status"] == "TCC102_NPCI_00_SW_FAIL_NO_CBS"
-    switch_status.loc[tcc102_mask] = "FAILED"
-    switch_resp_code.loc[tcc102_mask] = "U69"
+    # TCC 102 + NPCI Failed transactions: Switch shows FAILED (U69)
+    sw_fail_mask = switch_df["expected_recon_status"].isin([
+        "TCC102_NPCI_00_SW_FAIL_NO_CBS",
+        "FAILED_MATCHED_DECLINE",
+        "FAILED_CBS_DEBIT_BREAK"
+    ])
+    switch_status.loc[sw_fail_mask] = "FAILED"
+    switch_resp_code.loc[sw_fail_mask] = "U69"
 
     # RB cases where Switch recorded the RB reversal
     rb_sw_rev_mask = switch_df["expected_recon_status"].isin([
@@ -282,6 +295,10 @@ def build_recon_data(n, t_date, min_a, max_a, seed):
     cbs_status = pd.Series("SUCCESS", index=cbs_df.index, dtype=object)
     cbs_rev_flag = pd.Series("N", index=cbs_df.index, dtype=object)
 
+    # FAILED_MATCHED_DECLINE: CBS also recorded FAILED cleanly
+    cbs_fail_mask = cbs_df["expected_recon_status"] == "FAILED_MATCHED_DECLINE"
+    cbs_status.loc[cbs_fail_mask] = "FAILED"
+
     # RB_MATCHED_REVERSAL: CBS reversed cleanly
     rb_cbs_matched_mask = cbs_df["expected_recon_status"] == "RB_MATCHED_REVERSAL"
     cbs_status.loc[rb_cbs_matched_mask] = "REVERSED"
@@ -329,7 +346,7 @@ def build_recon_data(n, t_date, min_a, max_a, seed):
 
 # ================= UI & Export Logic =================
 if st.button("🚀 Generate Realistic Recon Files", type="primary"):
-    with st.spinner("Generating NPCI, Switch, and CBS files with clean bucket isolation..."):
+    with st.spinner("Generating NPCI, Switch, and CBS files with 00, RB, and Failed transactions..."):
         npci_file, switch_file, cbs_file, truth_log = build_recon_data(
             total_txns, txn_date, min_amt, max_amt, random_seed
         )
@@ -340,7 +357,7 @@ if st.button("🚀 Generate Realistic Recon Files", type="primary"):
         col1.metric("NPCI Rows", f"{len(npci_file):,}")
         col2.metric("Switch Rows", f"{len(switch_file):,}")
         col3.metric("CBS Rows", f"{len(cbs_file):,}")
-        col4.metric("Fully Matched Master Txns", f"{(truth_log['expected_recon_status'] == 'FULLY_MATCHED').sum():,}")
+        col4.metric("NPCI Failed (U-Codes)", f"{(~npci_file['Tlresponsecode'].isin(['00', 'RB'])).sum():,}")
 
         st.subheader("📊 Generated Reconciliation Breakdown (Master Reference)")
         summary_df = (
